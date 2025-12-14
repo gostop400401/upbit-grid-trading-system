@@ -1,0 +1,10 @@
+.env
+trading.db
+logs/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+venv/
+.DS_Store
+참고자료/

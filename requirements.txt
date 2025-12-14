@@ -1,0 +1,4 @@
+pyupbit
+discord.py
+python-dotenv
+aiohttp

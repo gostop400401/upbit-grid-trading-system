@@ -1,0 +1,17 @@
+[Unit]
+Description=Upbit Grid Trading Bot
+After=network.target
+
+[Service]
+# User running the bot
+User=root
+# Directory where the bot code is located
+WorkingDirectory=/root/upbit-grid-bot
+# Path to python executable in venv and main.py
+ExecStart=/root/upbit-grid-bot/venv/bin/python3 main.py
+# Auto-restart on failure
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
