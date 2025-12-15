@@ -110,6 +110,7 @@ class TradingManager:
         active_contracts = await Contract.get_active_contracts()
         logger.info(f"Found {len(active_contracts)} active contracts from DB.")
         
+        active_sell_count = 0
         for contract in active_contracts:
             uuid = contract.order_uuid
             if not uuid:
@@ -123,6 +124,7 @@ class TradingManager:
             state = status.get('state')
             if state == 'wait':
                 logger.info(f"Contract {contract.id} Sell Order {uuid} is active.")
+                active_sell_count += 1
             elif state == 'done':
                 logger.info(f"Contract {contract.id} Sell Order {uuid} is FILLED. Closing...")
                 await self.process_sell_fill(contract, contract.target_price, contract.buy_amount)
@@ -132,6 +134,14 @@ class TradingManager:
                 if new_uuid:
                     from database.database import execute_write
                     await execute_write("UPDATE contracts SET order_uuid = ? WHERE id = ?", (new_uuid, contract.id))
+        
+        # Summary for active sell orders
+        if active_sell_count > 0:
+            sell_prices = sorted(set(float(c.target_price) for c in active_contracts if c.order_uuid))
+            logger.info(f"✅ Successfully recovered {active_sell_count} active sell order(s).")
+            logger.info(f"📊 Sell prices: {sell_prices}")
+        else:
+            logger.info("No active sell orders to recover.")
         
         # 2. Recover Pending Buy Orders (CRITICAL FIX for restart)
         # Check if we have a saved config (meaning trading was active)
