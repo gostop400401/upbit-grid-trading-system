@@ -19,7 +19,7 @@ class TradingManager:
         self._monitor_task = None
         self._lock = asyncio.Lock()
         self.bot_start_time = datetime.now().timestamp()
-        self.pending_buy_orders = set() 
+        self.pending_buy_orders = {}  # Changed from set to dict {uuid: price} for tracking order prices
         self.notification_callback = None # Async callback for messages
 
     def set_notification_callback(self, callback):
@@ -185,7 +185,7 @@ class TradingManager:
             if not is_exist and current_grid <= current_price:
                 uuid = await self.handler.buy_limit_order(ticker, current_grid, amount)
                 if uuid:
-                    self.pending_buy_orders.add(uuid)
+                    self.pending_buy_orders[uuid] = current_grid  # Store UUID with price
                     logger.info(f"Placed Initial Buy: {current_grid} (UUID: {uuid})")
             elif is_exist:
                 logger.info(f"Skipping Grid {current_grid}: Active Contract Exists.")
@@ -217,7 +217,7 @@ class TradingManager:
                             
                         # Double check if already processed (just in case)
                         if await Contract.exists_buy_uuid(uuid):
-                            self.pending_buy_orders.discard(uuid)
+                            self.pending_buy_orders.pop(uuid, None)  # Remove from dict
                             continue
 
                         # It's a new fill from our order!
@@ -229,7 +229,7 @@ class TradingManager:
                         await self.process_buy_fill(uuid, price, executed_vol)
                         
                         # Remove from pending list
-                        self.pending_buy_orders.discard(uuid)
+                        self.pending_buy_orders.pop(uuid, None)  # Remove from dict
                 
                 # 3. Fill Empty Grids (Dynamic Order Placement)
                 await self._fill_empty_grids()
@@ -337,7 +337,7 @@ class TradingManager:
             
             new_buy_uuid = await self.handler.buy_limit_order(ticker, re_buy_price, re_buy_amount)
             if new_buy_uuid:
-                self.pending_buy_orders.add(new_buy_uuid) # Track this new order!
+                self.pending_buy_orders[new_buy_uuid] = re_buy_price  # Track with price
                 logger.info(f"Re-entry Buy Order Placed: {re_buy_price}, UUID: {new_buy_uuid}")
             else:
                 logger.error("Failed to place Re-entry Buy Order")
@@ -365,17 +365,13 @@ class TradingManager:
             active_contracts = await Contract.get_active_contracts()
             active_buy_prices = {float(c.buy_price) for c in active_contracts}
             
-            # Pending Buy Orders (waiting to buy)
-            # We need to know the price of pending orders.
-            # Since we just have UUIDs in pending_buy_orders, we might need to store price map 
-            # or query generic open orders.
-            # Querying "wait" orders is safer to know what's truly open on exchange.
-            # get_order request is expensive if done frequently. 
-            # Optimization: Do this check less frequently (e.g. every 10-20 sec) or rely on local tracking map.
-            # Let's use get_order(state='wait') but maybe throttle this specific function?
-            # actually _monitor_loop runs every 2s. We can add a counter or timer.
+            # Pending Buy Orders (locally tracked)
+            # CRITICAL FIX: Use local pending_buy_orders dict which now stores {uuid: price}
+            # This prevents duplicate orders when API responses are delayed
+            pending_buy_prices = set(self.pending_buy_orders.values())
             
-            # For simplicity/robustness V1: Fetch open orders.
+            # Also check exchange open orders as backup validation
+            # This helps catch any orders that might have been placed outside this session
             open_orders = await self.handler.get_open_orders(ticker)
             open_buy_prices = set()
             if open_orders:
@@ -398,19 +394,26 @@ class TradingManager:
                             is_contract_active = True
                             break
                     
-                    # Check if occupied by Open Buy Order
+                    # Check if occupied by Pending Buy Order (LOCAL TRACKING)
+                    is_pending = False
+                    for price in pending_buy_prices:
+                        if abs(price - current_grid) < epsilon:
+                            is_pending = True
+                            break
+                    
+                    # Check if occupied by Open Buy Order (EXCHANGE VERIFICATION)
                     is_order_open = False
                     for price in open_buy_prices:
                         if abs(price - current_grid) < epsilon:
                             is_order_open = True
                             break
                     
-                    # If EMPTY, place buy order
-                    if not is_contract_active and not is_order_open:
+                    # If EMPTY (no contract, no pending, no open order), place buy order
+                    if not is_contract_active and not is_pending and not is_order_open:
                         logger.info(f"Found Empty Grid at {current_grid} (Curr: {current_price}). Placing Buy Order...")
                         uuid = await self.handler.buy_limit_order(ticker, current_grid, amount)
                         if uuid:
-                            self.pending_buy_orders.add(uuid)
+                            self.pending_buy_orders[uuid] = current_grid  # Store with price
                 
                 current_grid += interval
 
