@@ -239,9 +239,19 @@ class DiscordBot(commands.Bot):
             logger.warning("Target channel not found for notification.")
 
     async def setup_hook(self):
-        # Load Cog
+        # Load Cogs
         await self.add_cog(TradingBotCog(self, self.trading_manager))
         logger.info("TradingBotCog loaded.")
+        
+        # Load Slash Commands Cog
+        try:
+            from modules.slash_commands import SlashCommandsCog
+            await self.add_cog(SlashCommandsCog(self, self.trading_manager))
+            logger.info("SlashCommandsCog loaded.")
+            
+            # Sync slash commands with Discord
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} slash command(s)")
 
     async def on_ready(self):
         logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
