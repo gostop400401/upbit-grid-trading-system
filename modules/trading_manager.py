@@ -102,8 +102,11 @@ class TradingManager:
     async def recover_state(self):
         """
         Recover state on startup.
+        Recovers both active contracts (sell orders) and pending buy orders.
         """
         logger.info("Starting State Recovery...")
+        
+        # 1. Recover Active Contracts (Sell Orders)
         active_contracts = await Contract.get_active_contracts()
         logger.info(f"Found {len(active_contracts)} active contracts from DB.")
         
@@ -129,6 +132,45 @@ class TradingManager:
                 if new_uuid:
                     from database.database import execute_write
                     await execute_write("UPDATE contracts SET order_uuid = ? WHERE id = ?", (new_uuid, contract.id))
+        
+        # 2. Recover Pending Buy Orders (CRITICAL FIX for restart)
+        # Check if we have a saved config (meaning trading was active)
+        saved_config = await get_config("last_grid_config")
+        if saved_config:
+            try:
+                import ast
+                self.config = ast.literal_eval(saved_config)
+                ticker = self.config.get('coin_ticker')
+                
+                if ticker:
+                    logger.info(f"Recovering pending buy orders for {ticker}...")
+                    
+                    # Get all open buy orders from exchange
+                    open_orders = await self.handler.get_open_orders(ticker)
+                    
+                    if open_orders:
+                        recovered_count = 0
+                        for order in open_orders:
+                            if order.get('side') == 'bid':  # Buy order
+                                order_uuid = order.get('uuid')
+                                order_price = float(order.get('price', 0))
+                                
+                                # Check if this order is not yet a contract
+                                # (If it's already a contract, it will be filled soon)
+                                if not await Contract.exists_buy_uuid(order_uuid):
+                                    self.pending_buy_orders[order_uuid] = order_price
+                                    recovered_count += 1
+                                    logger.info(f"Recovered Pending Buy Order: {order_price} KRW (UUID: {order_uuid})")
+                        
+                        if recovered_count > 0:
+                            logger.info(f"✅ Successfully recovered {recovered_count} pending buy order(s).")
+                            logger.info(f"📊 Pending prices: {sorted(set(self.pending_buy_orders.values()))}")
+                        else:
+                            logger.info("No pending buy orders found to recover.")
+                    else:
+                        logger.info("No open orders found on exchange.")
+            except Exception as e:
+                logger.error(f"Error recovering pending buy orders: {e}", exc_info=True)
 
     async def start_trading(self, config: Dict) -> str:
         if self.is_running:
