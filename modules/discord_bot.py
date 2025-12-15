@@ -252,6 +252,8 @@ class DiscordBot(commands.Bot):
             # Sync slash commands with Discord
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} slash command(s)")
+        except Exception as e:
+            logger.error(f"Failed to load SlashCommandsCog: {e}")
 
     async def on_ready(self):
         logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
