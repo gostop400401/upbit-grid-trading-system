@@ -183,20 +183,31 @@ class TradingManager:
                 logger.error(f"Error recovering pending buy orders: {e}", exc_info=True)
 
     async def start_trading(self, config: Dict) -> str:
-        if self.is_running:
-            return "Trading is already running."
+        # 🔒 CRITICAL: Lock으로 동시 start_trading 호출 방지
+        async with self._lock:
+            if self.is_running:
+                return "Trading is already running."
 
-        self.config = config
-        self.is_running = True
-        self.pending_buy_orders.clear() # Clear old tracking
-        
-        logger.info(f"Starting trading with config: {config}")
-        await set_config("last_grid_config", str(config))
+            # 기존 태스크가 있다면 명시적으로 취소
+            if self._monitor_task and not self._monitor_task.done():
+                logger.warning("Cancelling existing monitor task...")
+                self._monitor_task.cancel()
+                try:
+                    await self._monitor_task
+                except asyncio.CancelledError:
+                    logger.info("Previous monitor task cancelled successfully.")
 
-        await self._place_initial_orders()
-        self._monitor_task = asyncio.create_task(self._monitor_loop())
-        
-        return "Trading System Started."
+            self.config = config
+            self.is_running = True
+            self.pending_buy_orders.clear() # Clear old tracking
+            
+            logger.info(f"Starting trading with config: {config}")
+            await set_config("last_grid_config", str(config))
+
+            await self._place_initial_orders()
+            self._monitor_task = asyncio.create_task(self._monitor_loop())
+            
+            return "Trading System Started."
 
     async def stop_trading(self):
         self.is_running = False
@@ -394,80 +405,127 @@ class TradingManager:
             else:
                 logger.error("Failed to place Re-entry Buy Order")
 
+    async def _place_order_atomic(self, ticker: str, price: float, amount: float) -> Optional[str]:
+        """
+        🔒 원자적(Atomic) 주문 실행 함수
+        
+        "야, 나 이 가격에 주문 낼거다~" → "괜찮아/안돼"
+        
+        이 함수는 반드시 락(lock) 안에서만 호출되어야 합니다.
+        주문 직전에 마지막으로 중복을 확인합니다.
+        """
+        epsilon = 1e-4
+        
+        # 마지막 순간 재확인: "이미 주문 있어?"
+        # 1. 로컬 pending 확인
+        for existing_price in self.pending_buy_orders.values():
+            if abs(existing_price - price) < epsilon:
+                logger.warning(f"🚫 Order rejected: Already have pending order at {price}")
+                return None
+        
+        # 2. DB에서 active contracts 확인
+        active_contracts = await Contract.get_active_contracts()
+        for contract in active_contracts:
+            if abs(float(contract.buy_price) - price) < epsilon:
+                logger.warning(f"🚫 Order rejected: Active contract exists at {price}")
+                return None
+        
+        # 3. 거래소에 실제 주문 확인 (최종 방어선)
+        open_orders = await self.handler.get_open_orders(ticker)
+        if open_orders:
+            for order in open_orders:
+                if order.get('side') == 'bid' and abs(float(order.get('price', 0)) - price) < epsilon:
+                    logger.warning(f"🚫 Order rejected: Open order exists at {price}")
+                    return None
+        
+        # ✅ 모든 체크 통과! "괜찮아~ 주문 넣어!"
+        logger.info(f"✅ All checks passed. Placing order at {price}")
+        uuid = await self.handler.buy_limit_order(ticker, price, amount)
+        
+        if uuid:
+            self.pending_buy_orders[uuid] = price
+            logger.info(f"📝 Order registered: UUID={uuid}, Price={price}")
+        
+        return uuid
+
     async def _fill_empty_grids(self):
         """
         Check for empty grid levels below current price where no order/contract exists,
         and place buy orders there.
+        
+        🔒 전체 함수가 락(lock)으로 보호됩니다 - Race Condition 방지
         """
-        try:
-            ticker = self.config.get('coin_ticker')
-            if not ticker: return
-            
-            min_price = self.config['min_price']
-            max_price = self.config['max_price']
-            interval = self.config['grid_interval']
-            amount = self.config['amount_per_grid']
-            
-            # 1. Get Current Market Price
-            current_price = await self.handler.get_current_price(ticker)
-            if not current_price: return
-
-            # 2. Get All Active States
-            # Active Contracts (already bought)
-            active_contracts = await Contract.get_active_contracts()
-            active_buy_prices = {float(c.buy_price) for c in active_contracts}
-            
-            # Pending Buy Orders (locally tracked)
-            # CRITICAL FIX: Use local pending_buy_orders dict which now stores {uuid: price}
-            # This prevents duplicate orders when API responses are delayed
-            pending_buy_prices = set(self.pending_buy_orders.values())
-            
-            # Also check exchange open orders as backup validation
-            # This helps catch any orders that might have been placed outside this session
-            open_orders = await self.handler.get_open_orders(ticker)
-            open_buy_prices = set()
-            if open_orders:
-                for o in open_orders:
-                    if o.get('side') == 'bid':
-                         open_buy_prices.add(float(o.get('price')))
-            
-            # 3. Scan Grids
-            current_grid = min_price
-            epsilon = 1e-4
-            
-            while current_grid <= max_price:
-                # Target must be <= Current Price (Don't buy above market)
-                if current_grid <= current_price:
-                    
-                    # Check if occupied by Active Contract
-                    is_contract_active = False
-                    for price in active_buy_prices:
-                        if abs(price - current_grid) < epsilon:
-                            is_contract_active = True
-                            break
-                    
-                    # Check if occupied by Pending Buy Order (LOCAL TRACKING)
-                    is_pending = False
-                    for price in pending_buy_prices:
-                        if abs(price - current_grid) < epsilon:
-                            is_pending = True
-                            break
-                    
-                    # Check if occupied by Open Buy Order (EXCHANGE VERIFICATION)
-                    is_order_open = False
-                    for price in open_buy_prices:
-                        if abs(price - current_grid) < epsilon:
-                            is_order_open = True
-                            break
-                    
-                    # If EMPTY (no contract, no pending, no open order), place buy order
-                    if not is_contract_active and not is_pending and not is_order_open:
-                        logger.info(f"Found Empty Grid at {current_grid} (Curr: {current_price}). Placing Buy Order...")
-                        uuid = await self.handler.buy_limit_order(ticker, current_grid, amount)
-                        if uuid:
-                            self.pending_buy_orders[uuid] = current_grid  # Store with price
+        # 🔒 CRITICAL: 전체 함수를 락으로 보호 (문지기 패턴)
+        async with self._lock:
+            try:
+                ticker = self.config.get('coin_ticker')
+                if not ticker: return
                 
-                current_grid += interval
+                min_price = self.config['min_price']
+                max_price = self.config['max_price']
+                interval = self.config['grid_interval']
+                amount = self.config['amount_per_grid']
+                
+                # 1. Get Current Market Price
+                current_price = await self.handler.get_current_price(ticker)
+                if not current_price: return
 
-        except Exception as e:
-            logger.error(f"Error in _fill_empty_grids: {e}")
+                # 2. Get All Active States
+                # Active Contracts (already bought)
+                active_contracts = await Contract.get_active_contracts()
+                active_buy_prices = {float(c.buy_price) for c in active_contracts}
+                
+                # Pending Buy Orders (locally tracked)
+                pending_buy_prices = set(self.pending_buy_orders.values())
+                
+                # Also check exchange open orders as backup validation
+                open_orders = await self.handler.get_open_orders(ticker)
+                open_buy_prices = set()
+                if open_orders:
+                    for o in open_orders:
+                        if o.get('side') == 'bid':
+                             open_buy_prices.add(float(o.get('price')))
+                
+                # 3. Scan Grids
+                current_grid = min_price
+                epsilon = 1e-4
+                
+                while current_grid <= max_price:
+                    # Target must be <= Current Price (Don't buy above market)
+                    if current_grid <= current_price:
+                        
+                        # Check if occupied by Active Contract
+                        is_contract_active = False
+                        for price in active_buy_prices:
+                            if abs(price - current_grid) < epsilon:
+                                is_contract_active = True
+                                break
+                        
+                        # Check if occupied by Pending Buy Order (LOCAL TRACKING)
+                        is_pending = False
+                        for price in pending_buy_prices:
+                            if abs(price - current_grid) < epsilon:
+                                is_pending = True
+                                break
+                        
+                        # Check if occupied by Open Buy Order (EXCHANGE VERIFICATION)
+                        is_order_open = False
+                        for price in open_buy_prices:
+                            if abs(price - current_grid) < epsilon:
+                                is_order_open = True
+                                break
+                        
+                        # If EMPTY (no contract, no pending, no open order), place buy order
+                        if not is_contract_active and not is_pending and not is_order_open:
+                            logger.info(f"Found Empty Grid at {current_grid} (Curr: {current_price}). Requesting order...")
+                            # 🔒 원자적 주문 실행 (이미 락 안에 있음)
+                            uuid = await self._place_order_atomic(ticker, current_grid, amount)
+                            if uuid:
+                                logger.info(f"✅ Order placed successfully at {current_grid}")
+                            else:
+                                logger.warning(f"⚠️ Order rejected at {current_grid} (duplicate detected)")
+                    
+                    current_grid += interval
+
+            except Exception as e:
+                logger.error(f"Error in _fill_empty_grids: {e}")
