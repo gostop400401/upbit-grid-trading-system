@@ -578,8 +578,8 @@ class TradingManager:
             if not ticker: return
             quote, base = ticker.split('-')
             
-            # 1. Get Actual Balance from Exchange
-            actual_base_bal = await self.handler.get_balance(base)
+            # 1. Get Actual Balance from Exchange (TOTAL: available + locked)
+            actual_base_bal = await self.handler.get_total_balance(base)
             
             # 2. Get Sum of base currency held in DB contracts
             active_contracts = await Contract.get_active_contracts()

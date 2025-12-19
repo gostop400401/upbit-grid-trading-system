@@ -22,7 +22,7 @@
 
 ```powershell
 # 프로젝트 디렉토리로 이동
-cd "C:\Users\MINIMON\Desktop\AI작업\6.upbit usdt trading"
+cd "C:\Users\MINIMON\Desktop\AI Works\6.upbit usdt trading"
 
 # 변경된 파일 확인
 git status
@@ -55,7 +55,7 @@ git push
 
 ### SSH 접속 명령어
 ```powershell
-ssh -i "C:\Users\MINIMON\Desktop\AI작업\5.bn funding fee\ssh-key-2025-03-01.key" ubuntu@168.138.214.180
+ssh -i "C:\Users\MINIMON\Desktop\AI Works\5.bn funding fee\ssh-key-2025-03-01.key" ubuntu@168.138.214.180
 ```
 
 ### PowerShell 관리 스크립트 사용
@@ -93,7 +93,7 @@ sudo systemctl restart upbit-grid-bot
 
 ### 방법 3: SSH 원격 명령어
 ```powershell
-ssh -i "C:\Users\MINIMON\Desktop\AI작업\5.bn funding fee\ssh-key-2025-03-01.key" ubuntu@168.138.214.180 'cd upbit-grid-bot; git pull; sudo systemctl restart upbit-grid-bot'
+ssh -i "C:\Users\MINIMON\Desktop\AI Works\5.bn funding fee\ssh-key-2025-03-01.key" ubuntu@168.138.214.180 'cd upbit-grid-bot; git pull; sudo systemctl restart upbit-grid-bot'
 ```
 
 ---
@@ -346,7 +346,7 @@ sudo systemctl restart upbit-grid-bot
 
 ```powershell
 # 1. 로컬에서 코드 수정 후 GitHub 업로드
-cd "C:\Users\MINIMON\Desktop\AI작업\6.upbit usdt trading"
+cd "C:\Users\MINIMON\Desktop\AI Works\6.upbit usdt trading"
 git add .
 git commit -m "수정 내용"
 git push

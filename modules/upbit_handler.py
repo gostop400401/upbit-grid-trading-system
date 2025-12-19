@@ -70,6 +70,25 @@ class UpbitHandler:
         balance = await loop.run_in_executor(None, self.upbit.get_balance, currency)
         return Decimal(str(balance)) if balance else Decimal("0")
 
+    async def get_total_balance(self, ticker: str) -> Decimal:
+        """
+        Get TOTAL balance (available + locked) of specific ticker.
+        """
+        currency = ticker.split("-")[1] if "-" in ticker else ticker
+        
+        try:
+            loop = asyncio.get_running_loop()
+            balances = await loop.run_in_executor(None, self.upbit.get_balances)
+            
+            for b in balances:
+                if b.get('currency') == currency:
+                    total = Decimal(str(b.get('balance', 0))) + Decimal(str(b.get('locked', 0)))
+                    return total
+            return Decimal("0")
+        except Exception as e:
+            logger.error(f"Error fetching total balance for {currency}: {e}")
+            return Decimal("0")
+
     async def buy_limit_order(self, ticker: str, price: float, amount: float) -> Optional[str]:
         """
         Place a buy limit order.

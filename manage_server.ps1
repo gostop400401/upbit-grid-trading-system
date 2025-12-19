@@ -5,7 +5,7 @@ param(
     [string]$Command = "help"
 )
 
-$SERVER_KEY = "C:\Users\MINIMON\Desktop\AI작업\5.bn funding fee\ssh-key-2025-03-01.key"
+$SERVER_KEY = "C:\Users\MINIMON\Desktop\AI Works\5.bn funding fee\ssh-key-2025-03-01.key"
 $SERVER_IP = "168.138.214.180"
 $SERVER_USER = "ubuntu"
 $BOT_DIR = "upbit-grid-bot"
