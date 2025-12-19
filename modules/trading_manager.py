@@ -158,27 +158,36 @@ class TradingManager:
                     # Get all open buy orders from exchange
                     open_orders = await self.handler.get_open_orders(ticker)
                     
+                    recovered_count = 0
                     if open_orders:
-                        recovered_count = 0
                         for order in open_orders:
                             if order.get('side') == 'bid':  # Buy order
                                 order_uuid = order.get('uuid')
                                 order_price = float(order.get('price', 0))
                                 
                                 # Check if this order is not yet a contract
-                                # (If it's already a contract, it will be filled soon)
                                 if not await Contract.exists_buy_uuid(order_uuid):
                                     self.pending_buy_orders[order_uuid] = order_price
                                     recovered_count += 1
-                                    logger.info(f"Recovered Pending Buy Order: {order_price} KRW (UUID: {order_uuid})")
-                        
-                        if recovered_count > 0:
-                            logger.info(f"✅ Successfully recovered {recovered_count} pending buy order(s).")
-                            logger.info(f"📊 Pending prices: {sorted(set(self.pending_buy_orders.values()))}")
-                        else:
-                            logger.info("No pending buy orders found to recover.")
+                                    logger.info(f"Recovered Pending Buy Order: {order_price} (UUID: {order_uuid})")
+                    
+                    # NEW: Also check recently completed orders just in case some filled while bot was starting
+                    done_orders = await self.handler.get_completed_orders(ticker, limit=20)
+                    if isinstance(done_orders, list):
+                        for order in done_orders:
+                            if order.get('side') == 'bid' and order.get('state') == 'done':
+                                uuid = order.get('uuid')
+                                if not await Contract.exists_buy_uuid(uuid):
+                                    # This order was filled but we have no contract!
+                                    # We can't put it in pending_buy_orders (it's done), 
+                                    # so we should process it as a fill immediately if it's within our expected grids
+                                    # For safety, we'll let the self-healing sync catch this.
+                                    pass
+
+                    if recovered_count > 0:
+                        logger.info(f"✅ Successfully recovered {recovered_count} pending buy order(s).")
                     else:
-                        logger.info("No open orders found on exchange.")
+                        logger.info("No pending buy orders found to recover.")
             except Exception as e:
                 logger.error(f"Error recovering pending buy orders: {e}", exc_info=True)
 
@@ -232,30 +241,50 @@ class TradingManager:
 
         logger.info(f"Setting up grid. Current Price: {current_price}")
 
+        # Get both active contracts and currently open orders on exchange
         active_contracts = await Contract.get_active_contracts()
         existing_grid_prices = {float(c.buy_price) for c in active_contracts}
+        
+        open_orders = await self.handler.get_open_orders(ticker)
+        open_buy_prices = set()
+        if open_orders:
+            for o in open_orders:
+                if o.get('side') == 'bid':
+                    open_buy_prices.add(float(o.get('price')))
         
         current_grid = min_price
         epsilon = 1e-4
         
         while current_grid <= max_price:
             is_exist = False
+            # Check DB
             for exist_p in existing_grid_prices:
                 if abs(exist_p - current_grid) < epsilon:
                     is_exist = True
                     break
             
+            # Check Exchange Open Orders
+            if not is_exist:
+                for open_p in open_buy_prices:
+                    if abs(open_p - current_grid) < epsilon:
+                        is_exist = True
+                        # Also add to our local tracking if missing
+                        # This handles cases where orders existed but weren't in memory
+                        break
+
             if not is_exist and current_grid <= current_price:
                 uuid = await self.handler.buy_limit_order(ticker, current_grid, amount)
                 if uuid:
-                    self.pending_buy_orders[uuid] = current_grid  # Store UUID with price
+                    self.pending_buy_orders[uuid] = current_grid
                     logger.info(f"Placed Initial Buy: {current_grid} (UUID: {uuid})")
             elif is_exist:
-                logger.info(f"Skipping Grid {current_grid}: Active Contract Exists.")
+                logger.info(f"Skipping Grid {current_grid}: Already occupied (Contract or Open Order).")
                 
             current_grid += interval
 
-    async def _monitor_loop(self):
+        # NEW: Self-healing sync counter
+        sync_counter = 0
+
         while self.is_running:
             try:
                 # 1. Sync Active Contracts (Sell Fills)
@@ -263,39 +292,47 @@ class TradingManager:
                 for contract in active_contracts:
                     await self._check_sell_fill(contract)
                 
-                # 2. Check for New Buy Fills from 'done' orders
+                # 2. Check for New Buy Fills (Robust Polling)
                 ticker = self.config.get('coin_ticker')
                 if ticker:
-                    done_orders = await self.handler.get_completed_orders(ticker, limit=10)
-                    for order in done_orders:
-                        # Ensure it's a BUY order
-                        if order.get('side') != 'bid':
-                            continue
+                    # Method A: Specific status check for ALL pending orders (Most Reliable)
+                    pending_uuids = list(self.pending_buy_orders.keys())
+                    for uuid in pending_uuids:
+                        status = await self.handler.get_order_status(uuid)
+                        if status and status.get('state') == 'done':
+                            price = float(status.get('price', 0))
+                            volume = float(status.get('volume', 0))
+                            executed_vol = float(status.get('executed_volume', volume))
                             
-                        uuid = order.get('uuid')
-                        
-                        # Only process if it is in our pending list
-                        if uuid not in self.pending_buy_orders:
-                            continue
+                            logger.info(f"✅ [Robust Check] Detected Buy Fill: {uuid} @ {price}")
+                            await self.process_buy_fill(uuid, price, executed_vol)
+                            self.pending_buy_orders.pop(uuid, None)
+                    
+                    # Method B: Fast Polling of recent done orders (Good for high frequency)
+                    done_orders = await self.handler.get_completed_orders(ticker, limit=20)
+                    if isinstance(done_orders, list):
+                        for order in done_orders:
+                            if order.get('side') != 'bid': continue
+                            uuid = order.get('uuid')
                             
-                        # Double check if already processed (just in case)
-                        if await Contract.exists_buy_uuid(uuid):
-                            self.pending_buy_orders.pop(uuid, None)  # Remove from dict
-                            continue
-
-                        # It's a new fill from our order!
-                        price = float(order.get('price', 0)) 
-                        volume = float(order.get('volume', 0)) 
-                        executed_vol = float(order.get('executed_volume', volume))
-                        
-                        logger.info(f"Detected Buy Fill: {uuid} @ {price}, Vol: {executed_vol}")
-                        await self.process_buy_fill(uuid, price, executed_vol)
-                        
-                        # Remove from pending list
-                        self.pending_buy_orders.pop(uuid, None)  # Remove from dict
+                            if uuid in self.pending_buy_orders:
+                                # Found one through fast polling
+                                price = float(order.get('price', 0)) 
+                                volume = float(order.get('volume', 0)) 
+                                executed_vol = float(order.get('executed_volume', volume))
+                                
+                                logger.info(f"Detected Buy Fill (Fast Poll): {uuid} @ {price}")
+                                await self.process_buy_fill(uuid, price, executed_vol)
+                                self.pending_buy_orders.pop(uuid, None)
                 
-                # 3. Fill Empty Grids (Dynamic Order Placement)
+                # 3. Fill Empty Grids
                 await self._fill_empty_grids()
+
+                # 4. Periodic Self-Healing Sync (Every 1 minute approx)
+                sync_counter += 1
+                if sync_counter >= 30: # 2s * 30 = 60s
+                    await self._sync_with_exchange_balance()
+                    sync_counter = 0
 
                 await asyncio.sleep(2)
             except Exception as e:
@@ -529,3 +566,59 @@ class TradingManager:
 
             except Exception as e:
                 logger.error(f"Error in _fill_empty_grids: {e}")
+
+    async def _sync_with_exchange_balance(self):
+        """
+        Self-Healing Mechanism:
+        Compares actual exchange balance with DB contracts.
+        Rescues orphaned funds if mismatch discovered.
+        """
+        try:
+            ticker = self.config.get('coin_ticker')
+            if not ticker: return
+            quote, base = ticker.split('-')
+            
+            # 1. Get Actual Balance from Exchange
+            actual_base_bal = await self.handler.get_balance(base)
+            
+            # 2. Get Sum of base currency held in DB contracts
+            active_contracts = await Contract.get_active_contracts()
+            db_base_sum = sum(Decimal(str(c.buy_amount)) for c in active_contracts)
+            
+            # 3. Calculate Gap
+            # Upbit balance includes amount locked in sell orders.
+            # Our buy_amount is the amount we are trying to sell.
+            gap = actual_base_bal - db_base_sum
+            
+            # Tolerable noise (e.g. leftovers from previous trades or dust)
+            # Usually amount_per_grid is e.g. 4.0. If gap > 90% of a grid, it's a missing contract.
+            grid_amount = Decimal(str(self.config.get('amount_per_grid', 0)))
+            
+            if gap >= grid_amount * Decimal("0.9"):
+                logger.warning(f"⚖️ [Self-Healing] Balance Mismatch Detected! Exchange({actual_base_bal}) > DB({db_base_sum}). Gap: {gap}")
+                
+                # Try to identify which buy order was filled but not recorded
+                # We do this by looking at completed orders that are NOT in DB
+                done_orders = await self.handler.get_completed_orders(ticker, limit=50)
+                if isinstance(done_orders, list):
+                    rescued_count = 0
+                    for order in done_orders:
+                        if rescued_count >= int(gap / grid_amount): break
+                        
+                        if order.get('side') == 'bid' and order.get('state') == 'done':
+                            uuid = order.get('uuid')
+                            if not await Contract.exists_buy_uuid(uuid):
+                                # FOUND AN ORPHAN!
+                                price = float(order.get('price', 0))
+                                volume = float(order.get('volume', 0))
+                                executed_vol = float(order.get('executed_volume', volume))
+                                
+                                logger.info(f"🚑 [Self-Healing] Rescuing orphaned fill: {uuid} @ {price}")
+                                await self.process_buy_fill(uuid, price, executed_vol)
+                                rescued_count += 1
+                                
+                    if rescued_count > 0:
+                        await self._send_notification(f"🚑 **자기 치유(Self-Healing) 작동**\n"
+                                                      f"데이터베이스에 누락되었던 {rescued_count}개의 계약을 거래소 이력에서 찾아 복구했습니다.")
+        except Exception as e:
+            logger.error(f"Error in _sync_with_exchange_balance: {e}")
