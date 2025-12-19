@@ -282,6 +282,7 @@ class TradingManager:
                 
             current_grid += interval
 
+    async def _monitor_loop(self):
         # NEW: Self-healing sync counter
         sync_counter = 0
 
@@ -586,16 +587,13 @@ class TradingManager:
             db_base_sum = sum(Decimal(str(c.buy_amount)) for c in active_contracts)
             
             # 3. Calculate Gap
-            # Upbit balance includes amount locked in sell orders.
-            # Our buy_amount is the amount we are trying to sell.
             gap = actual_base_bal - db_base_sum
-            
-            # Tolerable noise (e.g. leftovers from previous trades or dust)
-            # Usually amount_per_grid is e.g. 4.0. If gap > 90% of a grid, it's a missing contract.
             grid_amount = Decimal(str(self.config.get('amount_per_grid', 0)))
             
+            logger.info(f"⚖️ [Self-Healing Check] Ticker: {ticker}, Total: {actual_base_bal}, DB: {db_base_sum}, Gap: {gap}, GridSize: {grid_amount}")
+
             if gap >= grid_amount * Decimal("0.9"):
-                logger.warning(f"⚖️ [Self-Healing] Balance Mismatch Detected! Exchange({actual_base_bal}) > DB({db_base_sum}). Gap: {gap}")
+                logger.warning(f"⚖️ [Self-Healing] Balance Mismatch Found! Gap: {gap}")
                 
                 # Try to identify which buy order was filled but not recorded
                 # We do this by looking at completed orders that are NOT in DB
