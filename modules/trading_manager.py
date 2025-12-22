@@ -555,13 +555,27 @@ class TradingManager:
                         
                         # If EMPTY (no contract, no pending, no open order), place buy order
                         if not is_contract_active and not is_pending and not is_order_open:
-                            logger.info(f"Found Empty Grid at {current_grid} (Curr: {current_price}). Requesting order...")
+                            logger.info(f"🔍 [GRID] Found Empty Grid at {current_grid} (Curr: {current_price})")
+                            logger.info(f"🔍 [GRID] Checks - Contract:{is_contract_active} Pending:{is_pending} Open:{is_order_open}")
+                            
+                            # FINAL CHECK: Double-check DB right before ordering
+                            final_check = await Contract.get_active_contracts()
+                            has_duplicate = any(abs(float(c.buy_price) - current_grid) < 1e-4 for c in final_check)
+                            
+                            if has_duplicate:
+                                logger.warning(f"⚠️ [GRID] DUPLICATE DETECTED at {current_grid} in final check - SKIP")
+                                continue
+                            
                             # 🔒 원자적 주문 실행 (이미 락 안에 있음)
+                            logger.info(f"📤 [GRID] Placing order at {current_grid}...")
                             uuid = await self._place_order_atomic(ticker, current_grid, amount)
                             if uuid:
-                                logger.info(f"✅ Order placed successfully at {current_grid}")
+                                logger.info(f"✅ [GRID] Order placed successfully at {current_grid} (UUID: {uuid[:8]}...)")
                             else:
-                                logger.warning(f"⚠️ Order rejected at {current_grid} (duplicate detected)")
+                                logger.warning(f"⚠️ [GRID] Order rejected at {current_grid} (duplicate detected)")
+                        else:
+                            if is_contract_active or is_pending or is_order_open:
+                                logger.debug(f"⏭️ [GRID] Skip {current_grid} - Contract:{is_contract_active} Pending:{is_pending} Open:{is_order_open}")
                     
                     current_grid += interval
 
